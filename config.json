@@ -1,0 +1,24 @@
+{
+  "peers": [
+    {
+      "asn": "AS153346",
+      "as_set": "AS153346:AS-HAWKNET",
+      "description": "HawkNet Labs"
+    }
+  ],
+  "router": {
+    "enabled": false,
+    "hostname": "192.168.1.1",
+    "username": "admin",
+    "password": "",
+    "port": 22
+  },
+  "settings": {
+    "irr_server": "whois.radb.net",
+    "ipv4_enabled": true,
+    "ipv6_enabled": true,
+    "output_directory": "./output",
+    "max_prefix_length_ipv4": 24,
+    "max_prefix_length_ipv6": 48
+  }
+}
