@@ -44,6 +44,7 @@ output/
 # Configuration files with sensitive data
 *_private.json
 *_secret.json
+config.json
 
 # OS
 .DS_Store

@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import argparse
 import time
+import hashlib
+import pickle
 
 try:
     import paramiko
@@ -53,6 +55,108 @@ class Settings:
 class IRRQueryError(Exception):
     """Exception raised for IRR query errors"""
     pass
+
+
+@dataclass
+class PeerState:
+    """State information for a peer's prefixes"""
+    ipv4_prefixes: List[str]
+    ipv6_prefixes: List[str]
+    last_updated: float
+    prefix_hash: str
+
+
+@dataclass  
+class PrefixDiff:
+    """Represents the differences in prefixes between runs"""
+    added_ipv4: List[str]
+    removed_ipv4: List[str] 
+    added_ipv6: List[str]
+    removed_ipv6: List[str]
+    unchanged_ipv4: List[str]
+    unchanged_ipv6: List[str]
+
+
+class StateManager:
+    """Manages state persistence for change detection"""
+    
+    def __init__(self, state_file: str = "bgp_filter_state.pkl"):
+        self.state_file = state_file
+        self.state: Dict[str, PeerState] = {}
+        self.load_state()
+    
+    def load_state(self):
+        """Load previous state from disk"""
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'rb') as f:
+                    self.state = pickle.load(f)
+                logging.info(f"Loaded state for {len(self.state)} peers from {self.state_file}")
+            else:
+                logging.info("No previous state found, starting fresh")
+        except Exception as e:
+            logging.warning(f"Failed to load state: {e}, starting fresh")
+            self.state = {}
+    
+    def save_state(self):
+        """Save current state to disk"""
+        try:
+            with open(self.state_file, 'wb') as f:
+                pickle.dump(self.state, f)
+            logging.info(f"Saved state for {len(self.state)} peers to {self.state_file}")
+        except Exception as e:
+            logging.error(f"Failed to save state: {e}")
+    
+    def get_prefix_hash(self, ipv4_prefixes: List[str], ipv6_prefixes: List[str]) -> str:
+        """Generate a hash of the prefix lists for change detection"""
+        # Sort prefixes to ensure consistent hashing
+        combined = sorted(ipv4_prefixes) + sorted(ipv6_prefixes)
+        content = '|'.join(combined)
+        return hashlib.sha256(content.encode()).hexdigest()
+    
+    def has_changed(self, asn: str, ipv4_prefixes: List[str], ipv6_prefixes: List[str]) -> bool:
+        """Check if prefixes have changed since last run"""
+        new_hash = self.get_prefix_hash(ipv4_prefixes, ipv6_prefixes)
+        
+        if asn not in self.state:
+            return True  # First time seeing this ASN
+        
+        return self.state[asn].prefix_hash != new_hash
+    
+    def update_peer_state(self, asn: str, ipv4_prefixes: List[str], ipv6_prefixes: List[str]):
+        """Update the state for a peer"""
+        prefix_hash = self.get_prefix_hash(ipv4_prefixes, ipv6_prefixes)
+        self.state[asn] = PeerState(
+            ipv4_prefixes=ipv4_prefixes.copy(),
+            ipv6_prefixes=ipv6_prefixes.copy(),
+            last_updated=time.time(),
+            prefix_hash=prefix_hash
+        )
+    
+    def get_previous_prefixes(self, asn: str) -> Tuple[List[str], List[str]]:
+        """Get the previous prefixes for a peer"""
+        if asn in self.state:
+            return self.state[asn].ipv4_prefixes, self.state[asn].ipv6_prefixes
+        return [], []
+    
+    def calculate_prefix_diff(self, asn: str, new_ipv4_prefixes: List[str], new_ipv6_prefixes: List[str]) -> PrefixDiff:
+        """Calculate the differences in prefixes between current and previous state"""
+        old_ipv4, old_ipv6 = self.get_previous_prefixes(asn)
+        
+        # Convert to sets for efficient operations
+        old_ipv4_set = set(old_ipv4)
+        new_ipv4_set = set(new_ipv4_prefixes)
+        old_ipv6_set = set(old_ipv6)
+        new_ipv6_set = set(new_ipv6_prefixes)
+        
+        return PrefixDiff(
+            added_ipv4=list(new_ipv4_set - old_ipv4_set),
+            removed_ipv4=list(old_ipv4_set - new_ipv4_set),
+            added_ipv6=list(new_ipv6_set - old_ipv6_set),
+            removed_ipv6=list(old_ipv6_set - new_ipv6_set),
+            unchanged_ipv4=list(new_ipv4_set & old_ipv4_set),
+            unchanged_ipv6=list(new_ipv6_set & old_ipv6_set)
+        )
 
 
 class PrefixAggregator:
@@ -247,6 +351,49 @@ class IRRClient:
             logging.error(f"Failed to query AS-SET {as_set}: {e}")
             return set()
     
+    def _is_valid_prefix(self, prefix: str) -> bool:
+        """
+        Validate if a string looks like a valid IP prefix
+        
+        Args:
+            prefix: String to validate
+            
+        Returns:
+            True if it looks like a valid prefix
+        """
+        if not prefix or not isinstance(prefix, str):
+            return False
+        
+        # Must contain a slash for CIDR notation
+        if '/' not in prefix:
+            return False
+        
+        # Basic format check: should be IP/mask
+        parts = prefix.split('/')
+        if len(parts) != 2:
+            return False
+        
+        ip_part, mask_part = parts
+        
+        # IP part should not be empty and should contain dots or colons
+        if not ip_part or (('.' not in ip_part) and (':' not in ip_part)):
+            return False
+        
+        # Mask part should be numeric
+        if not mask_part.isdigit():
+            return False
+        
+        # Additional sanity checks
+        mask = int(mask_part)
+        if ':' in ip_part:  # IPv6
+            if mask > 128:
+                return False
+        else:  # IPv4
+            if mask > 32:
+                return False
+        
+        return True
+
     def get_as_prefixes(self, asn: str) -> Tuple[List[str], List[str]]:
         """
         Get route prefixes announced by an AS
@@ -275,41 +422,47 @@ class IRRClient:
             for i, line in enumerate(lines):
                 line = line.strip()
                 
-                # Skip comments and headers
-                if line.startswith('%') or line.startswith('#'):
+                # Skip empty lines, comments and headers
+                if not line or line.startswith('%') or line.startswith('#'):
                     continue
                 
                 # Look for route objects
                 if line.startswith('route:'):
                     prefix = line[6:].strip()
                     logging.debug(f"Found route line {i+1}: '{prefix}'")
-                    try:
-                        network = ipaddress.ip_network(prefix, strict=False)
-                        if isinstance(network, ipaddress.IPv4Network):
-                            ipv4_prefixes.append(str(network))
-                            logging.debug(f"Added IPv4 prefix: {network}")
-                        elif isinstance(network, ipaddress.IPv6Network):
-                            ipv6_prefixes.append(str(network))
-                            logging.debug(f"Added IPv6 prefix: {network}")
-                    except ipaddress.AddressValueError as e:
-                        logging.warning(f"Invalid route prefix '{prefix}': {e}")
+                    if self._is_valid_prefix(prefix):
+                        try:
+                            network = ipaddress.ip_network(prefix, strict=False)
+                            if isinstance(network, ipaddress.IPv4Network):
+                                ipv4_prefixes.append(str(network))
+                                logging.debug(f"Added IPv4 prefix: {network}")
+                            elif isinstance(network, ipaddress.IPv6Network):
+                                ipv6_prefixes.append(str(network))
+                                logging.debug(f"Added IPv6 prefix: {network}")
+                        except ipaddress.AddressValueError as e:
+                            logging.warning(f"Invalid route prefix '{prefix}': {e}")
+                    else:
+                        logging.debug(f"Skipping invalid prefix format: '{prefix}'")
                 
                 elif line.startswith('route6:'):
                     prefix = line[7:].strip()
                     logging.debug(f"Found route6 line {i+1}: '{prefix}'")
-                    try:
-                        network = ipaddress.ip_network(prefix, strict=False)
-                        if isinstance(network, ipaddress.IPv6Network):
-                            ipv6_prefixes.append(str(network))
-                            logging.debug(f"Added IPv6 prefix: {network}")
-                    except ipaddress.AddressValueError as e:
-                        logging.warning(f"Invalid route6 prefix '{prefix}': {e}")
+                    if self._is_valid_prefix(prefix):
+                        try:
+                            network = ipaddress.ip_network(prefix, strict=False)
+                            if isinstance(network, ipaddress.IPv6Network):
+                                ipv6_prefixes.append(str(network))
+                                logging.debug(f"Added IPv6 prefix: {network}")
+                        except ipaddress.AddressValueError as e:
+                            logging.warning(f"Invalid route6 prefix '{prefix}': {e}")
+                    else:
+                        logging.debug(f"Skipping invalid prefix format: '{prefix}'")
                 
                 # For IRRd format (like APNIC), routes are on separate lines
                 elif self.server_config.get("supports_gii", False):
                     # Try to parse space-separated prefixes (IRRd format)
                     for prefix_candidate in line.split():
-                        if '/' in prefix_candidate and not prefix_candidate.startswith('%'):
+                        if self._is_valid_prefix(prefix_candidate):
                             try:
                                 network = ipaddress.ip_network(prefix_candidate, strict=False)
                                 if isinstance(network, ipaddress.IPv4Network):
@@ -344,10 +497,12 @@ class Config:
 class BGPPrefixGenerator:
     """Main class for generating BGP prefix filters"""
     
-    def __init__(self, config_file: str = "config.json"):
+    def __init__(self, config_file: str = "config.json", force_full: bool = False):
         self.config = self._load_config(config_file)
         self.irr_client = IRRClient(self.config.settings.irr_server)
         self.aggregator = PrefixAggregator()
+        self.state_manager = StateManager()
+        self.force_full = force_full
         
         # Create output directory
         Path(self.config.settings.output_directory).mkdir(parents=True, exist_ok=True)
@@ -503,34 +658,80 @@ class BGPPrefixGenerator:
         
         # Generate IPv4 prefix list
         if ipv4_prefixes and self.config.settings.ipv4_enabled:
-            filter_name = f"IMPORT-{asn}-IPv4"
+            filter_name = f"IMPORT-AS{asn}-V4"
             commands.append(f"# IPv4 prefix list for {peer.description} ({peer.asn})")
-            commands.append(f"/routing filter rule")
             
             # Delete existing filter rules for this chain
-            commands.append(f'remove [find chain="{filter_name}"]')
+            commands.append(f'/routing filter rule remove [find chain="{filter_name}"]')
             
             for prefix in ipv4_prefixes:
-                commands.append(f'add chain="{filter_name}" rule="if (dst in {prefix}) {{accept}}"')
+                commands.append(f'/routing filter rule add chain="{filter_name}" rule="if (dst in {prefix} && dst-len <= 24) {{accept}}"')
             
             # Add default deny rule
-            commands.append(f'add chain="{filter_name}" rule="reject"')
+            commands.append(f'/routing filter rule add chain="{filter_name}" rule="reject"')
             commands.append("")
         
         # Generate IPv6 prefix list
         if ipv6_prefixes and self.config.settings.ipv6_enabled:
-            filter_name = f"IMPORT-{asn}-IPv6"
+            filter_name = f"IMPORT-AS{asn}-V6"
             commands.append(f"# IPv6 prefix list for {peer.description} ({peer.asn})")
-            commands.append(f"/routing filter rule")
             
             # Delete existing filter rules for this chain
-            commands.append(f'remove [find chain="{filter_name}"]')
+            commands.append(f'/routing filter rule remove [find chain="{filter_name}"]')
             
             for prefix in ipv6_prefixes:
-                commands.append(f'add chain="{filter_name}" rule="if (dst in {prefix}) {{accept}}"')
+                commands.append(f'/routing filter rule add chain="{filter_name}" rule="if (dst in {prefix} && dst-len <= 48) {{accept}}"')
             
             # Add default deny rule
-            commands.append(f'add chain="{filter_name}" rule="reject"')
+            commands.append(f'/routing filter rule add chain="{filter_name}" rule="reject"')
+            commands.append("")
+        
+        return commands
+    
+    def generate_mikrotik_commands_differential(self, peer: Peer, prefix_diff: PrefixDiff) -> List[str]:
+        """
+        Generate Mikrotik RouterOS v7 commands for differential prefix updates
+        
+        Args:
+            peer: Peer configuration
+            prefix_diff: The differences in prefixes (added/removed/unchanged)
+            
+        Returns:
+            List of RouterOS commands for incremental changes only
+        """
+        commands = []
+        
+        # Extract AS number from ASN (remove 'AS' prefix)
+        asn = peer.asn.replace('AS', '')
+        
+        # Generate differential IPv4 commands
+        if (prefix_diff.added_ipv4 or prefix_diff.removed_ipv4) and self.config.settings.ipv4_enabled:
+            filter_name = f"IMPORT-AS{asn}-V4"
+            commands.append(f"# IPv4 prefix changes for {peer.description} ({peer.asn})")
+            
+            # Remove deleted prefixes
+            for prefix in prefix_diff.removed_ipv4:
+                commands.append(f'/routing filter rule remove [find chain="{filter_name}" && rule~"dst in {prefix}"]')
+            
+            # Add new prefixes (insert before the reject rule)
+            for prefix in prefix_diff.added_ipv4:
+                commands.append(f'/routing filter rule add chain="{filter_name}" place-before=[find chain="{filter_name}" && rule="reject"] rule="if (dst in {prefix} && dst-len <= 24) {{accept}}"')
+            
+            commands.append("")
+        
+        # Generate differential IPv6 commands  
+        if (prefix_diff.added_ipv6 or prefix_diff.removed_ipv6) and self.config.settings.ipv6_enabled:
+            filter_name = f"IMPORT-AS{asn}-V6"
+            commands.append(f"# IPv6 prefix changes for {peer.description} ({peer.asn})")
+            
+            # Remove deleted prefixes
+            for prefix in prefix_diff.removed_ipv6:
+                commands.append(f'/routing filter rule remove [find chain="{filter_name}" && rule~"dst in {prefix}"]')
+            
+            # Add new prefixes (insert before the reject rule)
+            for prefix in prefix_diff.added_ipv6:
+                commands.append(f'/routing filter rule add chain="{filter_name}" place-before=[find chain="{filter_name}" && rule="reject"] rule="if (dst in {prefix} && dst-len <= 48) {{accept}}"')
+            
             commands.append("")
         
         return commands
@@ -569,17 +770,22 @@ class BGPPrefixGenerator:
             )
             
             # Execute commands
-            for command in commands:
+            for i, command in enumerate(commands):
                 if command.strip() and not command.startswith('#'):
-                    logging.debug(f"Executing: {command}")
+                    logging.debug(f"Executing command {i+1}: {command}")
                     stdin, stdout, stderr = ssh.exec_command(command)
                     
+                    # Get output and error
+                    output = stdout.read().decode().strip()
+                    error = stderr.read().decode().strip()
+                    
                     # Check for errors
-                    error = stderr.read().decode()
                     if error:
-                        logging.error(f"Command failed: {command}")
+                        logging.error(f"Command {i+1} failed: {command}")
                         logging.error(f"Error: {error}")
                         return False
+                    elif output:
+                        logging.debug(f"Command {i+1} output: {output}")
             
             ssh.close()
             logging.info("Commands sent to router successfully")
@@ -619,6 +825,9 @@ class BGPPrefixGenerator:
         """Process all peers and generate prefix filters"""
         logging.info("Starting BGP prefix filter generation")
         
+        changed_peers = []
+        unchanged_peers = []
+        
         try:
             self.irr_client.connect()
             
@@ -627,21 +836,68 @@ class BGPPrefixGenerator:
                     # Generate prefix list
                     ipv4_prefixes, ipv6_prefixes = self.generate_prefix_list(peer)
                     
-                    # Generate Mikrotik commands
-                    commands = self.generate_mikrotik_commands(peer, ipv4_prefixes, ipv6_prefixes)
+                    # Check if prefixes have changed OR if full generation is forced
+                    has_changes = self.state_manager.has_changed(peer.asn, ipv4_prefixes, ipv6_prefixes)
+                    should_process = has_changes or self.force_full
                     
-                    if commands:
-                        # Try to send to router first
-                        if self.config.router.enabled:
-                            success = self.send_commands_to_router(commands)
-                            if not success:
-                                logging.warning("Failed to send to router, saving to file instead")
+                    if should_process:
+                        if has_changes:
+                            changed_peers.append(peer.asn)
+                            logging.info(f"Changes detected for {peer.asn}")
+                        else:
+                            # No changes but --full is specified
+                            changed_peers.append(peer.asn)
+                            logging.info(f"No changes detected for {peer.asn}, but generating full config due to --full flag")
+                        
+                        # Check if this is a completely new peer (no previous state) BEFORE updating state
+                        old_ipv4, old_ipv6 = self.state_manager.get_previous_prefixes(peer.asn)
+                        is_new_peer = not old_ipv4 and not old_ipv6
+                        
+                        # Calculate the differences (only needed if not forcing full)
+                        if has_changes and not self.force_full:
+                            prefix_diff = self.state_manager.calculate_prefix_diff(peer.asn, ipv4_prefixes, ipv6_prefixes)
+                            
+                            # Log the changes for visibility
+                            if prefix_diff.added_ipv4:
+                                logging.info(f"  Added IPv4 prefixes: {len(prefix_diff.added_ipv4)}")
+                            if prefix_diff.removed_ipv4:
+                                logging.info(f"  Removed IPv4 prefixes: {len(prefix_diff.removed_ipv4)}")
+                            if prefix_diff.added_ipv6:
+                                logging.info(f"  Added IPv6 prefixes: {len(prefix_diff.added_ipv6)}")
+                            if prefix_diff.removed_ipv6:
+                                logging.info(f"  Removed IPv6 prefixes: {len(prefix_diff.removed_ipv6)}")
+                        
+                        # Update state
+                        self.state_manager.update_peer_state(peer.asn, ipv4_prefixes, ipv6_prefixes)
+                        
+                        # Generate commands - use full rebuild for new peers, when forced, or differential for existing ones
+                        if is_new_peer or self.force_full:
+                            # New peer, first run, or force full generation - generate full commands
+                            if self.force_full:
+                                logging.info(f"  Generating full filter config (--full flag specified)")
+                            else:
+                                logging.info(f"  Generating full filter config (new peer)")
+                            commands = self.generate_mikrotik_commands(peer, ipv4_prefixes, ipv6_prefixes)
+                        else:
+                            # Existing peer with changes - generate differential commands
+                            logging.info(f"  Generating differential updates only")
+                            commands = self.generate_mikrotik_commands_differential(peer, prefix_diff)
+                        
+                        if commands:
+                            # Try to send to router first
+                            if self.config.router.enabled:
+                                success = self.send_commands_to_router(commands)
+                                if not success:
+                                    logging.warning("Failed to send to router, saving to file instead")
+                                    self.save_commands_to_file(peer, commands)
+                            else:
+                                # Save to file
                                 self.save_commands_to_file(peer, commands)
                         else:
-                            # Save to file
-                            self.save_commands_to_file(peer, commands)
+                            logging.info(f"No changes to apply for peer {peer.asn}")
                     else:
-                        logging.warning(f"No prefixes found for peer {peer.asn}")
+                        unchanged_peers.append(peer.asn)
+                        logging.info(f"No changes detected for {peer.asn}, skipping update")
                 
                 except Exception as e:
                     logging.error(f"Failed to process peer {peer.asn}: {e}")
@@ -649,8 +905,12 @@ class BGPPrefixGenerator:
         
         finally:
             self.irr_client.disconnect()
+            # Save state after all processing is complete
+            self.state_manager.save_state()
         
-        logging.info("BGP prefix filter generation completed")
+        logging.info(f"BGP prefix filter generation completed")
+        logging.info(f"Changed peers: {len(changed_peers)} - {', '.join(changed_peers) if changed_peers else 'None'}")
+        logging.info(f"Unchanged peers: {len(unchanged_peers)} - {', '.join(unchanged_peers) if unchanged_peers else 'None'}")
 
 
 def main():
@@ -659,6 +919,7 @@ def main():
     parser.add_argument("-c", "--config", default="config.json", help="Configuration file path")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--full", action="store_true", help="Generate full filter sets instead of differential updates")
     
     args = parser.parse_args()
     
@@ -681,7 +942,7 @@ def main():
     )
     
     try:
-        generator = BGPPrefixGenerator(args.config)
+        generator = BGPPrefixGenerator(args.config, force_full=args.full)
         generator.process_all_peers()
         
     except Exception as e:

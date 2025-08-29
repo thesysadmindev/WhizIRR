@@ -4,11 +4,16 @@
       "asn": "AS153346",
       "as_set": "AS153346:AS-HAWKNET",
       "description": "HawkNet Labs"
+    },
+    {
+      "asn": "AS136996",
+      "as_set": "AS136996:AS-PACNET",
+      "description": "Pacific Networks"
     }
   ],
   "router": {
     "enabled": false,
-    "hostname": "192.168.1.1",
+    "hostname": "160.187.124.7",
     "username": "admin",
     "password": "",
     "port": 22
