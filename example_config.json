@@ -1,25 +1,20 @@
 {
   "peers": [
     {
-      "asn": "AS153346",
-      "as_set": "AS153346:AS-HAWKNET",
-      "description": "HawkNet Labs"
-    },
-    {
-      "asn": "AS136996",
-      "as_set": "AS136996:AS-PACNET",
-      "description": "Pacific Networks"
+      "asn": "AS64512",
+      "as_set": "AS-EXAMPLE-PEER",
+      "description": "Example Peer Network"
     }
   ],
   "router": {
     "enabled": false,
-    "hostname": "160.187.124.7",
+    "hostname": "192.168.1.1",
     "username": "admin",
     "password": "",
     "port": 22
   },
   "settings": {
-    "irr_server": "whois.radb.net",
+    "irr_server": "whois.apnic.net",
     "ipv4_enabled": true,
     "ipv6_enabled": true,
     "output_directory": "./output",
