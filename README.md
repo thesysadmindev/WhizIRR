@@ -92,6 +92,11 @@ Use a custom configuration file:
 python3 bgp_filter_generator.py -c custom_config.json
 ```
 
+Generate full filter sets (force complete regeneration):
+```bash
+python3 bgp_filter_generator.py --full
+```
+
 Enable verbose logging:
 ```bash
 python3 bgp_filter_generator.py -v
@@ -101,6 +106,31 @@ Enable debug logging:
 ```bash
 python3 bgp_filter_generator.py --debug
 ```
+
+Combine options:
+```bash
+python3 bgp_filter_generator.py --full --debug -c custom_config.json
+```
+
+### Command Line Arguments
+
+- `--config`, `-c`: Specify custom configuration file path
+- `--full`: Force generation of complete filter sets for all peers, regardless of whether changes are detected
+- `--verbose`, `-v`: Enable verbose logging
+- `--debug`: Enable debug logging with detailed information
+- `--help`, `-h`: Show help message and available options
+
+### Generation Modes
+
+**Differential Mode (Default)**: The script tracks prefix changes and only generates commands for:
+- New peers (full filter set on first run)
+- Peers with detected prefix changes (differential updates)
+
+**Full Mode (--full flag)**: Forces complete filter regeneration for all peers, regardless of changes. Useful for:
+- Initial deployment
+- Recovery after configuration issues  
+- Periodic full refresh
+- Testing complete filter sets
 
 ## Output
 
